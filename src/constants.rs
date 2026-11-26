@@ -1,3 +1,9 @@
+use std::time::Duration;
+
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Watering {
     pub freq: i32,
     pub water: i32,

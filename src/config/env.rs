@@ -33,24 +33,26 @@ pub struct Config {
     pub admin_chat_id: i64,
     pub database_url: String,
     pub log_level: String,
-    pub telegram_api_url: String,
+    pub bot_api_base: String,
     pub telegram_max_retry_attempts: u32,
     pub telegram_max_retry_delay_seconds: u64,
 }
 
 impl Config {
     fn from_env() -> Self {
+        let bot_api_key = require_env("BOT_API_KEY");
+        let telegram_api_url = env::var("TELEGRAM_API_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| "https://api.telegram.org".to_string())
+            .trim_end_matches('/')
+            .to_string();
         Self {
-            bot_api_key: require_env("BOT_API_KEY"),
+            bot_api_base: format!("{telegram_api_url}/bot{bot_api_key}"),
+            bot_api_key,
             admin_chat_id: require_env_number("ADMIN_CHAT_ID"),
             database_url: require_env("DATABASE_URL"),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "debug".to_string()),
-            telegram_api_url: env::var("TELEGRAM_API_URL")
-                .ok()
-                .filter(|url| !url.is_empty())
-                .unwrap_or_else(|| "https://api.telegram.org".to_string())
-                .trim_end_matches('/')
-                .to_string(),
             telegram_max_retry_attempts: env_number_or("TELEGRAM_MAX_RETRY_ATTEMPTS", 3),
             telegram_max_retry_delay_seconds: env_number_or("TELEGRAM_MAX_RETRY_DELAY_SECONDS", 30),
         }

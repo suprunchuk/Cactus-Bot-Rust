@@ -28,7 +28,6 @@ fn callback_handler() -> crate::handlers::UpdateHandler {
 }
 
 fn message_handler() -> crate::handlers::UpdateHandler {
-
     Update::filter_message()
         .filter(|msg: Message| msg.text().is_some())
         .endpoint(skip_reason)
@@ -309,8 +308,7 @@ async fn skip_approve(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
         && next.chat_id != target_id
     {
         let next_date = queries::get_next_watering_date().await?;
-        if let Err(err) = send_rich(next.chat_id, &turn_passed_html(&next.name, next_date)).await
-        {
+        if let Err(err) = send_rich(next.chat_id, &turn_passed_html(&next.name, next_date)).await {
             tracing::warn!(%err, "notify failed");
         }
     }

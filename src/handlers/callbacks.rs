@@ -7,7 +7,9 @@ use crate::constants::WATERING;
 use crate::db::queries;
 use crate::helpers::dates;
 use crate::helpers::first_watering_html;
-use crate::helpers::rich::{answer_callback, cq_chat_id, cq_message_id, edit_rich, esc, send_rich};
+use crate::helpers::rich::{
+    answer_and_edit, answer_callback, cq_chat_id, cq_message_id, edit_rich, esc, send_rich,
+};
 use crate::helpers::turn_passed_html;
 use crate::helpers::{
     DOUBLE_CLICK_WINDOW, EARLY_WATERING_LIMIT, ensure_approved, is_current_waterer,
@@ -46,23 +48,23 @@ async fn join_queue(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error + S
     let (position, len) = queries::join_queue(chat_id).await?;
     let is_current = is_current_waterer(chat_id).await?;
 
-    answer_callback(&bot, &cq, None, false).await?;
-    if let Some(message_id) = cq_message_id(&cq) {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!(
-                "<h3>✅ Ты в очереди!</h3>\
-                 <p><b>{}</b>, ты в очереди по уходу за Максом!</p>\
-                 <p>📍 Позиция: <b>{}</b> из {}</p>{}",
-                esc(&user.name),
-                position + 1,
-                len,
-                main_menu_html(true, is_current)
-            ),
-        )
-        .await?;
-    }
+    answer_and_edit(
+        &bot,
+        &cq,
+        None,
+        false,
+        chat_id,
+        &format!(
+            "<h3>✅ Ты в очереди!</h3>\
+             <p><b>{}</b>, ты в очереди по уходу за Максом!</p>\
+             <p>📍 Позиция: <b>{}</b> из {}</p>{}",
+            esc(&user.name),
+            position + 1,
+            len,
+            main_menu_html(true, is_current)
+        ),
+    )
+    .await?;
 
     if len == 1 {
         send_rich(chat_id, &first_watering_html(&user.name)).await?;
@@ -113,21 +115,21 @@ async fn leave_queue(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error + 
         queries::set_waiting_skip_reason(chat_id, false).await?;
     }
 
-    answer_callback(&bot, &cq, Some("👋 Ты вышел из очереди"), false).await?;
-    if let Some(message_id) = cq_message_id(&cq) {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!(
-                "<h3>👋 Ты вышел из очереди</h3>\
-                 <p><b>{}</b>, ты вышел из очереди.</p>\
-                 <p>Можешь вернуться в любое время!</p>{}",
-                esc(&user.name),
-                main_menu_html(false, false)
-            ),
-        )
-        .await?;
-    }
+    answer_and_edit(
+        &bot,
+        &cq,
+        Some("👋 Ты вышел из очереди"),
+        false,
+        chat_id,
+        &format!(
+            "<h3>👋 Ты вышел из очереди</h3>\
+             <p><b>{}</b>, ты вышел из очереди.</p>\
+             <p>Можешь вернуться в любое время!</p>{}",
+            esc(&user.name),
+            main_menu_html(false, false)
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -140,48 +142,38 @@ async fn show_queue(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error + S
         return Ok(());
     }
 
-    answer_callback(&bot, &cq, None, false).await?;
+    // Ack уходит сразу, запросы к БД идут параллельно с ним.
+    let answer = answer_callback(&bot, &cq, None, false);
     let queue = queries::get_queue().await?;
 
-    if queue.is_empty() {
-        if let Some(message_id) = cq_message_id(&cq) {
-            edit_rich(
-                chat_id,
-                message_id,
-                &format!(
-                    "<h3>📋 Очередь пуста</h3>\
-                     <p>Нажми «Участвовать в поливе», чтобы ухаживать за <b>{}</b>! 🌵</p>{}",
-                    WATERING.name,
-                    back_html()
-                ),
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
-    let state = queries::get_queue_state().await?;
-    let current_turn = state.map(|s| s.current_turn).unwrap_or(0);
-    let lines: String = queue
-        .iter()
-        .enumerate()
-        .map(|(i, u)| {
-            let is_current = i as i32 == current_turn % queue.len() as i32;
-            if is_current {
-                format!("<p>💧 <b>{}</b> ← сейчас</p>", esc(&u.name))
-            } else {
-                format!("<p>{}. {}</p>", i + 1, esc(&u.name))
-            }
-        })
-        .collect();
-
-    if let Some(message_id) = cq_message_id(&cq) {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!("<h3>📋 Очередь полива Макса</h3>{lines}{}", back_html()),
+    let html = if queue.is_empty() {
+        format!(
+            "<h3>📋 Очередь пуста</h3>\
+             <p>Нажми «Участвовать в поливе», чтобы ухаживать за <b>{}</b>! 🌵</p>{}",
+            WATERING.name,
+            back_html()
         )
-        .await?;
+    } else {
+        let state = queries::get_queue_state().await?;
+        let current_turn = state.map(|s| s.current_turn).unwrap_or(0);
+        let lines: String = queue
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let is_current = i as i32 == current_turn % queue.len() as i32;
+                if is_current {
+                    format!("<p>💧 <b>{}</b> ← сейчас</p>", esc(&u.name))
+                } else {
+                    format!("<p>{}. {}</p>", i + 1, esc(&u.name))
+                }
+            })
+            .collect();
+        format!("<h3>📋 Очередь полива Макса</h3>{lines}{}", back_html())
+    };
+
+    answer.await?;
+    if let Some(message_id) = cq_message_id(&cq) {
+        edit_rich(chat_id, message_id, &html).await?;
     }
     Ok(())
 }
@@ -195,46 +187,35 @@ async fn show_history(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
         return Ok(());
     }
 
-    answer_callback(&bot, &cq, None, false).await?;
+    let answer = answer_callback(&bot, &cq, None, false);
     let history = queries::get_watering_history().await?;
 
-    if history.is_empty() {
-        if let Some(message_id) = cq_message_id(&cq) {
-            edit_rich(
-                chat_id,
-                message_id,
-                &format!(
-                    "<h3>💧 История поливов</h3>\
-                     <p>Макса ещё не поливали. История пуста.</p>{}",
-                    back_html()
-                ),
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
-    let lines: String = history
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            format!(
-                "<p>{}. {} — <b>{}</b> ({} мл)</p>",
-                i + 1,
-                dates::fmt_date_time(e.watered_at.and_utc()),
-                esc(e.name.as_deref().unwrap_or("—")),
-                e.water_ml
-            )
-        })
-        .collect();
-
-    if let Some(message_id) = cq_message_id(&cq) {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!("<h3>💧 История поливов Макса</h3>{lines}{}", back_html()),
+    let html = if history.is_empty() {
+        format!(
+            "<h3>💧 История поливов</h3>\
+             <p>Макса ещё не поливали. История пуста.</p>{}",
+            back_html()
         )
-        .await?;
+    } else {
+        let lines: String = history
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    "<p>{}. {} — <b>{}</b> ({} мл)</p>",
+                    i + 1,
+                    dates::fmt_date_time(e.watered_at.and_utc()),
+                    esc(e.name.as_deref().unwrap_or("—")),
+                    e.water_ml
+                )
+            })
+            .collect();
+        format!("<h3>💧 История поливов Макса</h3>{lines}{}", back_html())
+    };
+
+    answer.await?;
+    if let Some(message_id) = cq_message_id(&cq) {
+        edit_rich(chat_id, message_id, &html).await?;
     }
     Ok(())
 }
@@ -248,76 +229,58 @@ async fn show_next(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error + Se
         return Ok(());
     }
 
-    answer_callback(&bot, &cq, None, false).await?;
+    let answer = answer_callback(&bot, &cq, None, false);
     let next_date = queries::get_next_watering_date().await?;
     let current = queries::get_current_waterer().await?;
 
-    let Some(next_date) = next_date else {
-        if let Some(message_id) = cq_message_id(&cq) {
-            edit_rich(
-                chat_id,
-                message_id,
-                &format!(
-                    "<h3>⏭ Следующий полив</h3>\
-                     <p>Макса ещё не поливали через бота.</p>\
-                     <p>📌 Режим: каждые <b>~{} дней</b></p>\
-                     <p>👤 Первым поливает: <b>{}</b></p>{}",
-                    WATERING.freq,
-                    esc(current
-                        .as_ref()
-                        .map(|c| c.name.as_str())
-                        .unwrap_or("очередь пуста")),
-                    back_html()
-                ),
-            )
-            .await?;
-        }
-        return Ok(());
-    };
-
-    let days_left = dates::calendar_days_diff(
-        dates::calendar_date_in(dates::now()),
-        dates::calendar_date_in(next_date),
-    );
-
-    let Some(message_id) = cq_message_id(&cq) else {
-        return Ok(());
-    };
-
-    if days_left < 1 {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!(
-                "<h3>⚠️ Макса уже пора полить!</h3>\
-                 <p>👤 Очередь: <b>{}</b></p>\
-                 <p>💧 Объём: ~{}</p>{}",
-                esc(current.as_ref().map(|c| c.name.as_str()).unwrap_or("—")),
-                WATERING.water_label,
-                watered_with_back_html()
-            ),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    edit_rich(
-        chat_id,
-        message_id,
-        &format!(
-            "<h3>⏭ Следующий полив Макса</h3>\
-             <p>📅 Дата: <b>{}</b></p>\
-             <p>⏳ Через: <b>{} {}</b></p>\
-             <p>💧 Польёт: <b>{}</b> (~{})</p>{}",
-            dates::fmt_date(Some(next_date)),
-            days_left,
-            dates::plural_days_ru(days_left),
-            esc(current.as_ref().map(|c| c.name.as_str()).unwrap_or("—")),
-            WATERING.water_label,
+    let html = match next_date {
+        None => format!(
+            "<h3>⏭ Следующий полив</h3>\
+             <p>Макса ещё не поливали через бота.</p>\
+             <p>📌 Режим: каждые <b>~{} дней</b></p>\
+             <p>👤 Первым поливает: <b>{}</b></p>{}",
+            WATERING.freq,
+            esc(current
+                .as_ref()
+                .map(|c| c.name.as_str())
+                .unwrap_or("очередь пуста")),
             back_html()
         ),
-    )
-    .await?;
+        Some(next_date) => {
+            let days_left = dates::calendar_days_diff(
+                dates::calendar_date_in(dates::now()),
+                dates::calendar_date_in(next_date),
+            );
+            if days_left < 1 {
+                format!(
+                    "<h3>⚠️ Макса уже пора полить!</h3>\
+                     <p>👤 Очередь: <b>{}</b></p>\
+                     <p>💧 Объём: ~{}</p>{}",
+                    esc(current.as_ref().map(|c| c.name.as_str()).unwrap_or("—")),
+                    WATERING.water_label,
+                    watered_with_back_html()
+                )
+            } else {
+                format!(
+                    "<h3>⏭ Следующий полив Макса</h3>\
+                     <p>📅 Дата: <b>{}</b></p>\
+                     <p>⏳ Через: <b>{} {}</b></p>\
+                     <p>💧 Польёт: <b>{}</b> (~{})</p>{}",
+                    dates::fmt_date(Some(next_date)),
+                    days_left,
+                    dates::plural_days_ru(days_left),
+                    esc(current.as_ref().map(|c| c.name.as_str()).unwrap_or("—")),
+                    WATERING.water_label,
+                    back_html()
+                )
+            }
+        }
+    };
+
+    answer.await?;
+    if let Some(message_id) = cq_message_id(&cq) {
+        edit_rich(chat_id, message_id, &html).await?;
+    }
     Ok(())
 }
 
@@ -329,20 +292,20 @@ async fn back_to_menu(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
         return answer_callback(&bot, &cq, None, false).await;
     };
 
-    answer_callback(&bot, &cq, None, false).await?;
     let is_current = is_current_waterer(chat_id).await?;
 
-    if let Some(message_id) = cq_message_id(&cq) {
-        edit_rich(
-            chat_id,
-            message_id,
-            &format!(
-                "<h3>🌵 Главное меню</h3>{}",
-                main_menu_html(user.in_queue, is_current)
-            ),
-        )
-        .await?;
-    }
+    answer_and_edit(
+        &bot,
+        &cq,
+        None,
+        false,
+        chat_id,
+        &format!(
+            "<h3>🌵 Главное меню</h3>{}",
+            main_menu_html(user.in_queue, is_current)
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -356,7 +319,6 @@ async fn mark_watered(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
     let now = dates::now();
 
     if !is_current_waterer(chat_id).await? {
-
         let already =
             queries::watered_after(chat_id, now.naive_utc() - DOUBLE_CLICK_WINDOW).await?;
         let text = if already {
@@ -390,9 +352,9 @@ async fn mark_watered(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
     }
 
     let name = if user.name.is_empty() {
-        cq.from.first_name.clone()
+        cq.from.first_name.as_str()
     } else {
-        user.name.clone()
+        user.name.as_str()
     };
 
     let ok = queries::mark_watered(chat_id, WATERING.water, now.naive_utc()).await?;
@@ -410,10 +372,11 @@ async fn mark_watered(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
         queries::set_waiting_skip_reason(chat_id, false).await?;
     }
 
+    let answer = answer_callback(&bot, &cq, Some("✅ Отмечено!"), false);
     let next_user = queries::get_current_waterer().await?;
     let next_date = queries::get_next_watering_date().await?;
 
-    answer_callback(&bot, &cq, Some("✅ Отмечено!"), false).await?;
+    answer.await?;
     if let Some(message_id) = cq_message_id(&cq) {
         edit_rich(
             chat_id,
@@ -423,7 +386,7 @@ async fn mark_watered(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
                  <p><b>{}</b> полил Макса в {} 💧</p>\
                  <p>📅 Следующий полив: <b>{}</b></p>\
                  <p>👤 Польёт: <b>{}</b></p>{}",
-                esc(&name),
+                esc(name),
                 dates::fmt_date_time(now),
                 dates::fmt_date(next_date),
                 esc(next_user.as_ref().map(|u| u.name.as_str()).unwrap_or("—")),
@@ -433,7 +396,7 @@ async fn mark_watered(bot: Bot, cq: CallbackQuery) -> Result<(), Box<dyn Error +
         .await?;
     }
 
-    notify_next_waterer(&name, next_user.as_ref(), next_date, chat_id).await;
+    notify_next_waterer(name, next_user.as_ref(), next_date, chat_id).await;
     Ok(())
 }
 
@@ -504,8 +467,7 @@ async fn admin_skips_own_turn(
         && next.chat_id != chat_id
     {
         let next_date = queries::get_next_watering_date().await?;
-        if let Err(err) = send_rich(next.chat_id, &turn_passed_html(&next.name, next_date)).await
-        {
+        if let Err(err) = send_rich(next.chat_id, &turn_passed_html(&next.name, next_date)).await {
             tracing::warn!(%err, "notify failed");
         }
     }

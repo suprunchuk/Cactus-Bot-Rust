@@ -36,9 +36,11 @@ async fn check_and_notify() -> DbResult<()> {
             return Ok(());
         }
 
-        let overdue_days = dates::calendar_days_diff(dates::calendar_date_in(next_date), dates::calendar_date_in(now));
+        let overdue_days = dates::calendar_days_diff(
+            dates::calendar_date_in(next_date),
+            dates::calendar_date_in(now),
+        );
         if overdue_days <= 0 {
-
             format!(
                 "<h3>🌵 {}, пора полить Макса!</h3>\
                  <p>💧 Объём: ~{}</p>\
@@ -51,7 +53,11 @@ async fn check_and_notify() -> DbResult<()> {
             let when = if overdue_days == 1 {
                 "вчера".to_string()
             } else {
-                format!("{} {} назад", overdue_days, dates::plural_days_ru(overdue_days))
+                format!(
+                    "{} {} назад",
+                    overdue_days,
+                    dates::plural_days_ru(overdue_days)
+                )
             };
             format!(
                 "<h3>⚠️ {}, Макс до сих пор не полит!</h3>\

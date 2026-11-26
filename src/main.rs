@@ -16,11 +16,11 @@ use teloxide::prelude::*;
 use teloxide::types::{BotCommand, UpdateKind};
 
 use crate::config::env;
+use crate::constants::{CONNECT_TIMEOUT, REQUEST_TIMEOUT};
 use crate::handlers::UpdateHandler;
 
 #[tokio::main]
 async fn main() {
-
     dotenvy::dotenv().ok();
 
     config::logger::init();
@@ -35,31 +35,14 @@ async fn main() {
     }
     tracing::info!("Database connection established");
 
-    let bot = Bot::new(env::get().bot_api_key.clone());
+    let http = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("Не удалось создать HTTP-клиент");
+    let bot = Bot::with_client(env::get().bot_api_key.clone(), http);
 
-    let common_commands = vec![
-        BotCommand::new("start", "Запустить бота"),
-        BotCommand::new("menu", "Открыть главное меню"),
-        BotCommand::new("watered", "Отметить полив"),
-        BotCommand::new("help", "Показать список команд"),
-    ];
-    bot.set_my_commands(common_commands.clone())
-        .await
-        .expect("Не удалось установить список команд");
-
-    if let Some(admin_chat_id) = env::get().admin_chat() {
-        let mut admin_commands = common_commands.clone();
-        admin_commands.push(BotCommand::new("users", "Список пользователей (админ)"));
-        if let Err(err) = bot
-            .set_my_commands(admin_commands)
-            .scope(teloxide::types::BotCommandScope::Chat {
-                chat_id: ChatId(admin_chat_id).into(),
-            })
-            .await
-        {
-            tracing::warn!(%err, "setMyCommands for admin failed");
-        }
-    }
+    setup_commands(&bot).await;
 
     tracing::info!("Bot started");
 
@@ -72,10 +55,78 @@ async fn main() {
         .await;
 }
 
+async fn setup_commands(bot: &Bot) {
+    let common_commands = vec![
+        BotCommand::new("start", "Запустить бота"),
+        BotCommand::new("menu", "Открыть главное меню"),
+        BotCommand::new("watered", "Отметить полив"),
+        BotCommand::new("help", "Показать список команд"),
+    ];
+    let admin_chat_id = env::get().admin_chat();
+
+    for scope in [
+        teloxide::types::BotCommandScope::Default,
+        teloxide::types::BotCommandScope::AllPrivateChats,
+    ] {
+        for language in [None, Some("ru")] {
+            if let Err(err) =
+                set_commands(bot, common_commands.clone(), scope.clone(), language).await
+            {
+                tracing::error!(?scope, ?language, %err, "setMyCommands failed");
+            }
+        }
+    }
+
+    match db::queries::list_user_chat_ids().await {
+        Ok(chat_ids) => {
+            for chat_id in chat_ids.iter().filter(|id| Some(**id) != admin_chat_id) {
+                for language in [None, Some("ru")] {
+                    let scope = teloxide::types::BotCommandScope::Chat {
+                        chat_id: ChatId(*chat_id).into(),
+                    };
+                    if let Err(err) =
+                        set_commands(bot, common_commands.clone(), scope, language).await
+                    {
+                        tracing::warn!(chat_id, ?language, %err, "setMyCommands (chat) failed");
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(%err, "list_user_chat_ids failed: персональные списки команд не обновлены")
+        }
+    }
+
+    if let Some(admin_chat_id) = admin_chat_id {
+        let mut admin_commands = common_commands.clone();
+        admin_commands.push(BotCommand::new("users", "Список пользователей (админ)"));
+        for language in [None, Some("ru")] {
+            let scope = teloxide::types::BotCommandScope::Chat {
+                chat_id: ChatId(admin_chat_id).into(),
+            };
+            if let Err(err) = set_commands(bot, admin_commands.clone(), scope, language).await {
+                tracing::warn!(?language, %err, "setMyCommands for admin failed");
+            }
+        }
+    }
+}
+
+async fn set_commands(
+    bot: &Bot,
+    commands: Vec<BotCommand>,
+    scope: teloxide::types::BotCommandScope,
+    language: Option<&str>,
+) -> Result<(), teloxide::errors::RequestError> {
+    let mut req = bot.set_my_commands(commands).scope(scope);
+    if let Some(language) = language {
+        req = req.language_code(language);
+    }
+    req.await.map(|_| ())
+}
+
 fn build_handler() -> UpdateHandler {
     catch_errors(one_update_at_a_time_per_chat(
         dptree::map_async(log_update)
-
             .chain(dptree::filter(|upd: Update| {
                 upd.chat().is_some_and(|chat| chat.is_private())
             }))
@@ -111,7 +162,6 @@ async fn log_update(upd: Update) -> Update {
 }
 
 async fn upsert_user_middleware(upd: Update) -> Update {
-
     let is_start = matches!(&upd.kind, UpdateKind::Message(msg)
         if msg.text().is_some_and(|text| text.trim_start().starts_with("/start")));
     if !is_start

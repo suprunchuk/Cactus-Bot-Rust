@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fmt::Display;
+use std::fmt::{self, Display, Write};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -10,19 +10,66 @@ use teloxide::requests::Requester;
 use teloxide::types::{CallbackQuery, MaybeInaccessibleMessage};
 
 use crate::config::env;
+use crate::constants::{CONNECT_TIMEOUT, REQUEST_TIMEOUT};
 use crate::db::DbResult;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub fn esc(value: impl Display) -> String {
-    value
-        .to_string()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::new();
+    let _ = write!(EscWriter { out: &mut out }, "{value}");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esc_escapes_all_special_chars() {
+        assert_eq!(esc("a<&>\"b"), "a&lt;&amp;&gt;&quot;b");
+    }
+
+    #[test]
+    fn esc_keeps_plain_text_and_multibyte_utf8() {
+        assert_eq!(esc("Кактус Макс 🌵"), "Кактус Макс 🌵");
+    }
+
+    #[test]
+    fn esc_escapes_around_multibyte_chars() {
+        assert_eq!(esc("🌵&🌴<x"), "🌵&amp;🌴&lt;x");
+    }
+
+    #[test]
+    fn esc_works_with_any_display_type() {
+        assert_eq!(esc(42), "42");
+    }
+}
+
+struct EscWriter<'a> {
+    out: &'a mut String,
+}
+
+impl Write for EscWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        escape_into(s, self.out);
+        Ok(())
+    }
+}
+
+fn escape_into(s: &str, out: &mut String) {
+    let mut copied = 0;
+    for (i, byte) in s.bytes().enumerate() {
+        let replacement = match byte {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        out.push_str(&s[copied..i]);
+        out.push_str(replacement);
+        copied = i + 1;
+    }
+    out.push_str(&s[copied..]);
 }
 
 pub fn btn(label: &str, data: &str) -> String {
@@ -59,20 +106,11 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("Не удалось создать HTTP-клиент для Telegram API")
 });
 
-async fn post_bot_api(
-    method: &str,
-    payload: Value,
-) -> Result<Value, Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/bot{}/{}",
-        env::get().telegram_api_url,
-        env::get().bot_api_key,
-        method
-    );
+async fn post_bot_api(method: &str, payload: Value) -> Result<Value, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{}", env::get().bot_api_base, method);
     let max_attempts = env::get().telegram_max_retry_attempts;
     let fallback_delay = env::get().telegram_max_retry_delay_seconds;
 
@@ -108,10 +146,7 @@ fn api_error(method: &str, status: reqwest::StatusCode, body: &Value) -> String 
     format!("Telegram API error in {method}: {description}")
 }
 
-pub async fn send_rich(
-    chat_id: i64,
-    html: &str,
-) -> Result<Value, Box<dyn Error + Send + Sync>> {
+pub async fn send_rich(chat_id: i64, html: &str) -> Result<Value, Box<dyn Error + Send + Sync>> {
     post_bot_api(
         "sendRichMessage",
         json!({
@@ -127,7 +162,6 @@ pub async fn edit_rich(
     message_id: i64,
     html: &str,
 ) -> Result<Value, Box<dyn Error + Send + Sync>> {
-
     post_bot_api(
         "editMessageText",
         json!({
@@ -151,6 +185,24 @@ pub async fn answer_callback(
     }
     req.await?;
     Ok(())
+}
+
+pub async fn answer_and_edit(
+    bot: &Bot,
+    cq: &CallbackQuery,
+    text: Option<&str>,
+    alert: bool,
+    chat_id: i64,
+    html: &str,
+) -> DbResult<()> {
+    let (answer, edit) = tokio::join!(answer_callback(bot, cq, text, alert), async {
+        match cq_message_id(cq) {
+            Some(message_id) => edit_rich(chat_id, message_id, html).await.map(|_| ()),
+            None => Ok(()),
+        }
+    },);
+    answer?;
+    edit
 }
 
 pub fn cq_chat_id(cq: &CallbackQuery) -> Option<i64> {

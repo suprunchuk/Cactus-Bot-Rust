@@ -44,15 +44,15 @@ pub fn calendar_days_diff(from_day: NaiveDate, to_day: NaiveDate) -> i64 {
     (to_day - from_day).num_days()
 }
 
-pub fn plural_days_ru(n: i64) -> String {
+pub fn plural_days_ru(n: i64) -> &'static str {
     let m10 = n % 10;
     let m100 = n % 100;
     if m10 == 1 && m100 != 11 {
-        "день".to_string()
+        "день"
     } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
-        "дня".to_string()
+        "дня"
     } else {
-        "дней".to_string()
+        "дней"
     }
 }
 

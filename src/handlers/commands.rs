@@ -50,7 +50,11 @@ fn new_user_request_html(name: &str, username: Option<&str>, chat_id: i64) -> St
          <p>Username: {username_html}</p>{}",
         esc(name),
         row(&[
-            btn_styled("✅ Принять", &format!("admin_user_accept_{chat_id}"), "success"),
+            btn_styled(
+                "✅ Принять",
+                &format!("admin_user_accept_{chat_id}"),
+                "success"
+            ),
             btn_styled(
                 "⛔ Отклонить",
                 &format!("admin_user_reject_{chat_id}"),
@@ -65,15 +69,12 @@ async fn start(msg: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
     let name = msg
         .from
         .as_ref()
-        .map(|u| u.first_name.clone())
+        .map(|u| u.first_name.as_str())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "Пользователь".to_string());
-    let username = msg.from.as_ref().and_then(|u| u.username.clone());
+        .unwrap_or("Пользователь");
+    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
 
-    let is_new = queries::upsert_user_start(chat_id, &name, username.as_deref()).await?;
-    let user = queries::get_user(chat_id)
-        .await?
-        .ok_or("Пользователь только что вставлен, но не найден — БД ведёт себя странно")?;
+    let (is_new, user) = queries::upsert_user_start(chat_id, name, username).await?;
 
     let is_admin = env::get().admin_chat_id == chat_id;
 
@@ -82,7 +83,7 @@ async fn start(msg: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     if !user.approved && !is_admin {
-        return start_pending(chat_id, &name, username.as_deref(), is_new).await;
+        return start_pending(chat_id, name, username, is_new).await;
     }
 
     let is_current = is_current_waterer(chat_id).await?;
@@ -94,7 +95,7 @@ async fn start(msg: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
          <p>💧 Объём: <b>{}</b></p>\
          <p>🕙 Уведомление: <b>{}</b></p>\
          <p>Нажми <b>«Участвовать в поливе»</b>, чтобы встать в очередь.</p>{}",
-        esc(&name),
+        esc(name),
         WATERING.freq,
         WATERING.water_label,
         WATERING.time,
@@ -110,11 +111,13 @@ async fn start_pending(
     username: Option<&str>,
     is_new: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-
     if is_new
         && let Some(admin_chat_id) = env::get().admin_chat()
-        && let Err(err) =
-            send_rich(admin_chat_id, &new_user_request_html(name, username, chat_id)).await
+        && let Err(err) = send_rich(
+            admin_chat_id,
+            &new_user_request_html(name, username, chat_id),
+        )
+        .await
     {
         tracing::warn!(%err, "Не удалось уведомить админа о новом пользователе");
     }
@@ -198,8 +201,7 @@ async fn watered(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + Send + Sy
     let now = dates::now();
 
     if !is_current_waterer(chat_id).await? {
-        let text = if queries::watered_after(chat_id, now.naive_utc() - DOUBLE_CLICK_WINDOW)
-            .await?
+        let text = if queries::watered_after(chat_id, now.naive_utc() - DOUBLE_CLICK_WINDOW).await?
         {
             "✅ Уже отмечено!"
         } else {
@@ -239,10 +241,10 @@ async fn watered(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + Send + Sy
     let name = if user.name.is_empty() {
         msg.from
             .as_ref()
-            .map(|u| u.first_name.clone())
-            .unwrap_or_else(|| "Кто-то".to_string())
+            .map(|u| u.first_name.as_str())
+            .unwrap_or("Кто-то")
     } else {
-        user.name.clone()
+        user.name.as_str()
     };
 
     let next_user = queries::get_current_waterer().await?;
@@ -253,14 +255,14 @@ async fn watered(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + Send + Sy
          <p><b>{}</b> полил Макса 💧</p>\
          <p>📅 Следующий полив: <b>{}</b></p>\
          <p>👤 Следующий: <b>{}</b></p>{}",
-        esc(&name),
+        esc(name),
         dates::fmt_date(next_date),
         esc(next_user.as_ref().map(|u| u.name.as_str()).unwrap_or("—")),
         after_watering_html()
     );
     send_rich(chat_id, &html).await?;
 
-    notify_next_waterer(&name, next_user.as_ref(), next_date, chat_id).await;
+    notify_next_waterer(name, next_user.as_ref(), next_date, chat_id).await;
     Ok(())
 }
 

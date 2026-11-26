@@ -1,5 +1,4 @@
 services:
-
     postgres:
         image: postgres:19
         container_name: cactus-postgres
@@ -21,6 +20,7 @@ services:
 
     bot:
         build: .
+        pull_policy: build
         container_name: cactus-bot
         restart: always
         environment:

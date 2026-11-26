@@ -46,23 +46,42 @@ pub async fn upsert_user(
              VALUES ($1, $2, $3, FALSE)
              ON CONFLICT (chat_id) DO UPDATE
                SET name     = COALESCE(EXCLUDED.name, users.name),
-                   username = COALESCE(EXCLUDED.username, users.username)",
+                   username = COALESCE(EXCLUDED.username, users.username)
+             WHERE users.name IS DISTINCT FROM COALESCE(EXCLUDED.name, users.name)
+                OR users.username IS DISTINCT FROM COALESCE(EXCLUDED.username, users.username)",
             &[&chat_id, &first_name, &username],
         )
         .await?;
     Ok(())
 }
 
-pub async fn get_user(chat_id: i64) -> DbResult<Option<User>> {
+pub async fn list_user_chat_ids() -> DbResult<Vec<i64>> {
     let rows = db()
         .get()
         .await?
-        .query("SELECT * FROM users WHERE chat_id = $1", &[&chat_id])
+        .query("SELECT chat_id FROM users", &[])
         .await?;
-    Ok(rows.first().map(user_from_row))
+    Ok(rows.iter().map(|row| row.get("chat_id")).collect())
 }
 
-pub async fn upsert_user_start(chat_id: i64, name: &str, username: Option<&str>) -> DbResult<bool> {
+pub async fn get_user(chat_id: i64) -> DbResult<Option<User>> {
+    let row = db()
+        .get()
+        .await?
+        .query_opt(
+            "SELECT name, in_queue, approved, waiting_skip_reason
+             FROM users WHERE chat_id = $1",
+            &[&chat_id],
+        )
+        .await?;
+    Ok(row.as_ref().map(user_from_row))
+}
+
+pub async fn upsert_user_start(
+    chat_id: i64,
+    name: &str,
+    username: Option<&str>,
+) -> DbResult<(bool, User)> {
     let row = db()
         .get()
         .await?
@@ -70,11 +89,13 @@ pub async fn upsert_user_start(chat_id: i64, name: &str, username: Option<&str>)
             "INSERT INTO users (chat_id, name, username)
              VALUES ($1, $2, $3)
              ON CONFLICT (chat_id) DO UPDATE SET name = $2, username = $3
-             RETURNING xmax = 0 AS inserted",
+             RETURNING xmax = 0 AS inserted,
+                       name, in_queue, approved, waiting_skip_reason",
             &[&chat_id, &name, &username],
         )
         .await?;
-    Ok(row.get("inserted"))
+    let inserted: bool = row.get("inserted");
+    Ok((inserted, user_from_row(&row)))
 }
 
 pub async fn approve_user(chat_id: i64) -> DbResult<()> {
@@ -149,7 +170,8 @@ pub async fn get_queue() -> DbResult<Vec<User>> {
         .get()
         .await?
         .query(
-            "SELECT * FROM users WHERE in_queue = TRUE ORDER BY queue_position ASC",
+            "SELECT name, in_queue, approved, waiting_skip_reason
+             FROM users WHERE in_queue = TRUE ORDER BY queue_position ASC",
             &[],
         )
         .await?;
@@ -160,7 +182,7 @@ pub async fn get_queue_state() -> DbResult<Option<QueueState>> {
     let rows = db()
         .get()
         .await?
-        .query("SELECT * FROM queue_state WHERE id = 1", &[])
+        .query("SELECT current_turn FROM queue_state WHERE id = 1", &[])
         .await?;
     Ok(rows.first().map(|row| QueueState {
         current_turn: row.get("current_turn"),
@@ -191,7 +213,6 @@ pub async fn get_watering_history() -> DbResult<Vec<WateringHistoryItem>> {
         .get()
         .await?
         .query(
-
             "SELECT u.name, w.watered_at, w.water_ml
              FROM watering_log w
              LEFT JOIN users u ON u.id = w.user_id
@@ -210,30 +231,20 @@ pub async fn get_watering_history() -> DbResult<Vec<WateringHistoryItem>> {
 }
 
 pub async fn get_current_waterer() -> DbResult<Option<CurrentWaterer>> {
-    let client = db().get().await?;
-
-    let current_turn: i32 = client
-        .query_one("SELECT current_turn FROM queue_state WHERE id = 1", &[])
+    let rows = db()
+        .get()
         .await?
-        .get("current_turn");
-
-    let len: i32 = client
-        .query_one(
-            "SELECT COUNT(*)::int AS len FROM users WHERE in_queue = TRUE",
-            &[],
-        )
-        .await?
-        .get("len");
-    if len <= 0 {
-        return Ok(None);
-    }
-
-    let idx = current_turn % len;
-    let rows = client
         .query(
-            "SELECT chat_id, name FROM users WHERE in_queue = TRUE
-             ORDER BY queue_position ASC OFFSET $1 LIMIT 1",
-            &[&i64::from(idx)],
+            "WITH qs AS (SELECT COALESCE(current_turn, 0) AS turn FROM queue_state WHERE id = 1),
+                    cnt AS (SELECT COUNT(*)::int AS n FROM users WHERE in_queue = TRUE),
+                    ranked AS (SELECT u.chat_id, u.name,
+                                      ROW_NUMBER() OVER (ORDER BY u.queue_position) AS rn
+                               FROM users u WHERE u.in_queue = TRUE)
+             SELECT chat_id, name
+             FROM ranked, qs, cnt
+             WHERE rn = (GREATEST(qs.turn, 0) % GREATEST(cnt.n, 1)) + 1
+             LIMIT 1",
+            &[],
         )
         .await?;
 
@@ -261,7 +272,7 @@ pub async fn get_next_watering_date() -> DbResult<Option<DateTime<Utc>>> {
 
     let watered_utc: NaiveDateTime = row.get("watered_at");
     let last_day = dates::calendar_date_in(watered_utc.and_utc());
-    let mut day = last_day + chrono::Duration::days(WATERING.freq as i64);
+    let mut day = last_day + chrono::Duration::days(i64::from(WATERING.freq));
     match day.weekday() {
         Weekday::Sat => day += chrono::Duration::days(2),
         Weekday::Sun => day += chrono::Duration::days(1),
@@ -338,26 +349,23 @@ pub async fn leave_queue(chat_id: i64) -> DbResult<i32> {
     let mut client = db().get().await?;
     let tx = client.transaction().await?;
 
-    let current_turn = tx
+    let row = tx
         .query_opt(
-            "SELECT current_turn FROM queue_state WHERE id = 1 FOR UPDATE",
-            &[],
-        )
-        .await?
-        .and_then(|row| row.get::<_, Option<i32>>("current_turn"))
-        .unwrap_or(0);
-
-    let rows = tx
-        .query(
-            "SELECT queue_position FROM users WHERE chat_id = $1 AND in_queue = TRUE",
+            "SELECT COALESCE(qs.current_turn, 0) AS current_turn,
+                    (SELECT u.queue_position FROM users u
+                     WHERE u.chat_id = $1 AND u.in_queue = TRUE
+                     LIMIT 1) AS leaving_position
+             FROM queue_state qs
+             WHERE qs.id = 1
+             FOR UPDATE",
             &[&chat_id],
         )
         .await?;
-
-    let leaving_position = rows
-        .first()
-        .and_then(|row| row.get::<_, Option<i32>>("queue_position"));
-    let Some(leaving_position) = leaving_position else {
+    let Some(row) = row else {
+        return Ok(0);
+    };
+    let current_turn: i32 = row.get("current_turn");
+    let Some(leaving_position) = row.get::<_, Option<i32>>("leaving_position") else {
         tx.commit().await?;
         return Ok(0);
     };
@@ -408,22 +416,18 @@ pub async fn mark_watered(
     let mut client = db().get().await?;
     let tx = client.transaction().await?;
 
-    let current_turn = tx
-        .query_opt(
-            "SELECT current_turn FROM queue_state WHERE id = 1 FOR UPDATE",
-            &[],
-        )
-        .await?
-        .and_then(|row| row.get::<_, Option<i32>>("current_turn"))
-        .unwrap_or(0);
-
-    let len: i32 = tx
+    let row = tx
         .query_one(
-            "SELECT COUNT(*)::int AS len FROM users WHERE in_queue = TRUE",
+            "SELECT COALESCE(qs.current_turn, 0) AS current_turn,
+                    (SELECT COUNT(*)::int FROM users WHERE in_queue = TRUE) AS len
+             FROM queue_state qs
+             WHERE qs.id = 1
+             FOR UPDATE",
             &[],
         )
-        .await?
-        .get("len");
+        .await?;
+    let current_turn: i32 = row.get("current_turn");
+    let len: i32 = row.get("len");
     if len <= 0 {
         tx.commit().await?;
         return Ok(false);
@@ -486,17 +490,18 @@ pub async fn pass_turn(chat_id: i64) -> DbResult<bool> {
     let mut client = db().get().await?;
     let tx = client.transaction().await?;
 
-    let current_turn: i32 = tx
-        .query_one("SELECT current_turn FROM queue_state WHERE id = 1 FOR UPDATE", &[])
-        .await?
-        .get("current_turn");
-    let len: i32 = tx
+    let row = tx
         .query_one(
-            "SELECT COUNT(*)::int AS len FROM users WHERE in_queue = TRUE",
+            "SELECT COALESCE(qs.current_turn, 0) AS current_turn,
+                    (SELECT COUNT(*)::int FROM users WHERE in_queue = TRUE) AS len
+             FROM queue_state qs
+             WHERE qs.id = 1
+             FOR UPDATE",
             &[],
         )
-        .await?
-        .get("len");
+        .await?;
+    let current_turn: i32 = row.get("current_turn");
+    let len: i32 = row.get("len");
     if len <= 0 {
         tx.commit().await?;
         return Ok(false);

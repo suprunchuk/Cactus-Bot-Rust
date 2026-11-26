@@ -13,6 +13,7 @@ static DB: LazyLock<Pool> = LazyLock::new(|| {
 
     let manager = Manager::new(pg_config, NoTls);
     Pool::builder(manager)
+        .max_size(4)
         .build()
         .expect("Не удалось создать пул соединений с PostgreSQL")
 });
